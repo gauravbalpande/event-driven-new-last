@@ -1,0 +1,298 @@
+name: Deploy Infrastructure and Code
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_VERSION: 1.6.0
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  lint-and-validate:
+    name: Lint and Validate Code
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pylint flake8 black
+
+      - name: Lint Python Code - Processor
+        run: |
+          cd lambda/processor
+          python -m pylint *.py --exit-zero || true
+          python -m flake8 *.py --max-line-length=120 || true
+
+      - name: Lint Python Code - Reporter
+        run: |
+          cd lambda/reporter
+          python -m pylint *.py --exit-zero || true
+          python -m flake8 *.py --max-line-length=120 || true
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov Security Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          soft_fail: true
+          output_format: cli
+
+      - name: Run TruffleHog Secret Scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  unit-tests:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Test Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov boto3 moto
+
+      - name: Run Unit Tests
+        run: |
+          pytest tests/ --cov=lambda --cov-report=xml --cov-report=term
+        continue-on-error: true
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [security-scan, unit-tests]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -var="notification_email=${{ secrets.NOTIFICATION_EMAIL }}" \
+                         -var="environment=${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}" \
+                         -out=tfplan
+        continue-on-error: true
+
+      - name: Save Terraform Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan
+          path: tfplan
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Plan 📖
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            
+            </details>
+            
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://console.aws.amazon.com/lambda
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+                         -var="notification_email=${{ secrets.NOTIFICATION_EMAIL }}" \
+                         -var="environment=prod"
+
+      - name: Get Terraform Outputs
+        id: outputs
+        run: |
+          echo "processor_lambda=$(terraform output -raw processor_lambda_name)" >> $GITHUB_OUTPUT
+          echo "reporter_lambda=$(terraform output -raw reporter_lambda_name)" >> $GITHUB_OUTPUT
+          echo "raw_bucket=$(terraform output -raw raw_data_bucket_name)" >> $GITHUB_OUTPUT
+
+      - name: Create Deployment Summary
+        run: |
+          echo "## Deployment Summary 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** Production" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployed Resources" >> $GITHUB_STEP_SUMMARY
+          echo "- Processor Lambda: \`${{ steps.outputs.outputs.processor_lambda }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Reporter Lambda: \`${{ steps.outputs.outputs.reporter_lambda }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Raw Data Bucket: \`${{ steps.outputs.outputs.raw_bucket }}\`" >> $GITHUB_STEP_SUMMARY
+
+  post-deployment-tests:
+    name: Post-Deployment Tests
+    runs-on: ubuntu-latest
+    needs: terraform-apply
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install AWS CLI and Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 awscli
+
+      - name: Verify Lambda Functions Exist
+        run: |
+          aws lambda get-function --function-name event-pipeline-processor-prod
+          aws lambda get-function --function-name event-pipeline-reporter-prod
+
+      - name: Verify S3 Buckets Exist
+        run: |
+          aws s3 ls s3://event-pipeline-raw-data-prod
+          aws s3 ls s3://event-pipeline-processed-data-prod
+          aws s3 ls s3://event-pipeline-reports-prod
+
+      - name: Verify DynamoDB Table Exists
+        run: |
+          aws dynamodb describe-table --table-name event-pipeline-metadata-prod
+
+      - name: Run Smoke Tests
+        run: |
+          echo "Running smoke tests..."
+          python tests/smoke_test.py
+        continue-on-error: true
+
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [terraform-apply, post-deployment-tests]
+    if: always()
+    
+    steps:
+      - name: Notify Success
+        if: needs.terraform-apply.result == 'success'
+        run: |
+          echo "✅ Deployment successful!"
+          # Add Slack/Email notification here if needed
+
+      - name: Notify Failure
+        if: needs.terraform-apply.result == 'failure'
+        run: |
+          echo "❌ Deployment failed!"
+          # Add Slack/Email notification here if needed
