@@ -1,0 +1,4 @@
+id,name,value,timestamp
+1,Test Record 1,100,2025-01-01 10:00:00
+2,Test Record 2,200,2025-01-01 10:01:00
+3,Test Record 3,300,2025-01-01 10:02:00
